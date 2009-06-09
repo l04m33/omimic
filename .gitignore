@@ -1,0 +1,12 @@
+config.c
+gadget_chips.h
+epautoconf.c
+usbstring.c
+
+*.o
+*.ko
+*.mod.c
+.*.cmd
+*.symvers
+*.order
+.tmp_versions
