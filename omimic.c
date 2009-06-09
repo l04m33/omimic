@@ -1,19 +1,17 @@
 /*
- * =====================================================================================
+ * =======================================================================
  *
  *       Filename:  omimic.c
  *
- *    Description:  a driver to mimic input devices, using the old API
+ *    Description:  a USB gadget driver to mimic HID input devices.
  *
- *        Version:  0x0001
+ *        Version:  0.1
  *        Created:  01/23/2009 11:15:54 PM
- *       Revision:  none
  *       Compiler:  gcc
  *
- *         Author:  l_amee (l_amee), l04m33@gmail.com
- *        Company:  SYSU
+ *         Author:  Kay Zheng (l_amee), l04m33@gmail.com
  *
- * =====================================================================================
+ * =======================================================================
  */
 
 
@@ -43,25 +41,31 @@ MODULE_AUTHOR("Kay Zheng");
 
 
 #ifdef OMIMIC_DEBUG
-#define PDBG(fmt, args...) printk(KERN_DEBUG "omimic: " fmt, ## args)
+#define PDBG(fmt, args...) \
+    printk(KERN_DEBUG "omimic: " fmt, ## args)
 #else
 #define PDBG(fmt, args...) /* empty debug slot */
 #endif
 
-#define OMIMIC_PERR(fmt, args...) printk(KERN_NOTICE "omimic: " fmt, ## args)
-#define OMIMIC_PINFO(fmt, args...) printk(KERN_NOTICE "omimic: " fmt, ## args)
+#define OMIMIC_PERR(fmt, args...) \
+    printk(KERN_NOTICE "omimic: " fmt, ## args)
+#define OMIMIC_PINFO(fmt, args...) \
+    printk(KERN_NOTICE "omimic: " fmt, ## args)
+
 
 /************* types **************/
+
 struct omimic_dev {
     struct usb_request *ctrl_req;
-    struct list_head idle_list; /* list for idle requests */
-    struct list_head busy_list; /* list for busy requests */
+    struct list_head idle_list;
+    struct list_head busy_list;
+
     struct usb_ep *kbd_ep;
     struct usb_ep *mouse_ep;
-    //const char *kbd_ep_name;
-    //const char *mouse_ep_name;
-    spinlock_t lock;
+
+    spinlock_t lock;   /* this lock protects the whole structure */
     u8 cur_config;
+
     dev_t devno;
     struct cdev cdev;
 };
@@ -76,25 +80,28 @@ struct omimic_req {
 
 static int  omimic_bind(struct usb_gadget *);
 static void omimic_unbind(struct usb_gadget *);
-static int  omimic_setup(struct usb_gadget *, const struct usb_ctrlrequest *);
-static void omimic_setup_complete(struct usb_ep *ep, struct usb_request *req);
+static int  omimic_setup(struct usb_gadget *, 
+                         const struct usb_ctrlrequest *);
 static void omimic_disconnect(struct usb_gadget *);
 static void omimic_suspend(struct usb_gadget *);
 static void omimic_resume(struct usb_gadget *);
 static int  omimic_set_config(struct usb_gadget*, unsigned, unsigned);
+
+static void omimic_setup_complete(struct usb_ep *, struct usb_request *);
+static void intr_complete(struct usb_ep *, struct usb_request *);
+
+static int set_km_config(struct usb_gadget *, unsigned);
 static void omimic_reset_config(struct usb_gadget*);
 static void __free_ep_req(struct usb_ep *ep, struct usb_request *req);
 static int config_buf(struct usb_gadget *, u8 *, u8, unsigned);
-static int set_km_config(struct usb_gadget *, unsigned);
-static void intr_complete(struct usb_ep *, struct usb_request *);
 static struct usb_request *alloc_ep_req(struct usb_ep*, unsigned);
+static int populate_req_list(struct list_head *, struct usb_ep *, 
+                             void *, int, int);
 
 static int omimic_open(struct inode *, struct file *);
 static int omimic_release(struct inode *, struct file *);
-static ssize_t omimic_write(struct file *, const char __user *, size_t, loff_t *);
-
-static int populate_req_list(struct list_head *, struct usb_ep *, void *, int, int);
-
+static ssize_t omimic_write(struct file *, const char __user *, 
+                            size_t, loff_t *);
 
 int  __init omimic_init(void);
 void __exit omimic_exit(void);
@@ -102,8 +109,8 @@ module_init(omimic_init);
 module_exit(omimic_exit);
 
 
-
 /************* other globals **************/
+
 static struct file_operations omimic_fops = {
     .open    = omimic_open,
     .release = omimic_release,
@@ -213,7 +220,7 @@ static char STRING_SERIAL[40] = "0123456789.0123456789.0123456789";
 static struct usb_string omimic_strings[] = {
     { STRIDX_MANUFACTURER, STRING_MANUFACTURER },
     { STRIDX_PRODUCT, LONG_NAME },
-    { STRIDX_SERIAL, STRING_SERIAL }, // XXX: is this mandatory?
+    { STRIDX_SERIAL, STRING_SERIAL },
     { STRIDX_KBD, STRING_KBD },
     { STRIDX_MOUSE, STRING_MOUSE },
     { },
@@ -227,6 +234,7 @@ static struct usb_gadget_strings omimic_strtab = {
 
 /************* descriptors **************/
 
+/* XXX: arbitrary vendor & product IDs */
 #define OMIMIC_VENDOR_NUM    0x2929
 #define OMIMIC_PRODUCT_NUM   0x2929
 
@@ -234,11 +242,13 @@ static struct usb_device_descriptor omimic_dev_desc = {
 	.bLength         =  sizeof(omimic_dev_desc),
 	.bDescriptorType =  USB_DT_DEVICE,
 	.bcdUSB          =  __constant_cpu_to_le16(0x0110),
-    .bcdDevice       =  __constant_cpu_to_le16(0x0212), /* the driver is for s3c24xx */
-	.bDeviceClass    =  0,                              /* the class is decided by the interfaces */
+    /* bdcDevice is set for s3c24xx, may not be suitable for other chips */
+    .bcdDevice       =  __constant_cpu_to_le16(0x0212),
+    /* the class is decided by the interfaces */
+	.bDeviceClass    =  0,
 	.idVendor        =  __constant_cpu_to_le16(OMIMIC_VENDOR_NUM),
 	.idProduct       =  __constant_cpu_to_le16(OMIMIC_PRODUCT_NUM),
-	.bNumConfigurations =  1,
+	.bNumConfigurations = 1,
 };
 
 static struct usb_qualifier_descriptor omimic_dev_qualifier = {
@@ -257,7 +267,7 @@ static struct usb_qualifier_descriptor omimic_dev_qualifier = {
 static struct usb_interface_descriptor kbd_intf = {
     .bLength = sizeof(kbd_intf),
     .bDescriptorType = USB_DT_INTERFACE,
-    .bInterfaceNumber = KBD_INTF_NUM,    /* first interface */
+    .bInterfaceNumber = KBD_INTF_NUM,  /* first interface */
     .bNumEndpoints = 1,
     .bInterfaceClass = USB_CLASS_HID,
     .bInterfaceSubClass = 1,  /* 'boot interface' */
@@ -267,13 +277,13 @@ static struct usb_interface_descriptor kbd_intf = {
 
 static struct hid_descriptor kbd_hid_desc = {
     .bLength = sizeof(kbd_hid_desc),
-    .bDescriptorType = 33, /* hid descriptor */
+    .bDescriptorType = 33,  /* hid descriptor */
     .bcdHID = __constant_cpu_to_le16(0x0110),
     .bCountryCode = 0,
     .bNumDescriptors = 1,
     .desc = {
         [0] = {
-            .bDescriptorType = 34, /* report descriptor */
+            .bDescriptorType = 34,  /* report descriptor */
             .wDescriptorLength = __constant_cpu_to_le16(sizeof(kbd_report_desc)),
         },
     },
@@ -293,7 +303,7 @@ static struct usb_endpoint_descriptor kbd_ep_desc = {
 static struct usb_interface_descriptor mouse_intf = {
     .bLength = sizeof(mouse_intf),
     .bDescriptorType = USB_DT_INTERFACE,
-    .bInterfaceNumber = MOUSE_INTF_NUM,    /* second interface */
+    .bInterfaceNumber = MOUSE_INTF_NUM,  /* second interface */
     .bNumEndpoints = 1,
     .bInterfaceClass = USB_CLASS_HID,
     .bInterfaceSubClass = 1,  /* 'boot interface' */
@@ -303,14 +313,15 @@ static struct usb_interface_descriptor mouse_intf = {
 
 static struct hid_descriptor mouse_hid_desc = {
     .bLength = sizeof(mouse_hid_desc),
-    .bDescriptorType = 33, /* hid descriptor */
+    .bDescriptorType = 33,  /* hid descriptor */
     .bcdHID = __constant_cpu_to_le16(0x0110),
     .bCountryCode = 0,
     .bNumDescriptors = 1,
     .desc = {
         [0] = {
-            .bDescriptorType = 34, /* report descriptor */
-            .wDescriptorLength = __constant_cpu_to_le16(sizeof(mouse_report_desc)),
+            .bDescriptorType = 34,  /* report descriptor */
+            .wDescriptorLength =
+                __constant_cpu_to_le16(sizeof(mouse_report_desc)),
         },
     },
 };
@@ -348,7 +359,6 @@ static struct usb_config_descriptor km_config = {
 
 
 
-
 /************* implementations **************/
 
 static int  omimic_bind(struct usb_gadget *gadget)
@@ -372,23 +382,23 @@ static int  omimic_bind(struct usb_gadget *gadget)
     /* kbd endpoint */
     odev->kbd_ep = usb_ep_autoconfig(gadget, &kbd_ep_desc);
     if(!odev->kbd_ep){
-        OMIMIC_PERR("can't automatically config gadget: %s\n", gadget->name);
+        OMIMIC_PERR("can't automatically config gadget: %s\n", 
+                    gadget->name);
         omimic_unbind(gadget);
         return -ENODEV;
     }
     PDBG("ep configured: %s\n", odev->kbd_ep->name);
-    odev->kbd_ep->driver_data = odev; /* claiming the endpoint */
-    //odev->kbd_ep_name = odev->kbd_ep->name; /* XXX: ??? */
+    odev->kbd_ep->driver_data = odev;  /* claiming the endpoint */
     /* mouse endpoint */
     odev->mouse_ep = usb_ep_autoconfig(gadget, &mouse_ep_desc);
     if(!odev->mouse_ep){
-        OMIMIC_PERR("can't automatically config gadget: %s\n", gadget->name);
+        OMIMIC_PERR("can't automatically config gadget: %s\n",
+                    gadget->name);
         omimic_unbind(gadget);
         return -ENODEV;
     }
     PDBG("ep configured: %s\n", odev->mouse_ep->name);
     odev->mouse_ep->driver_data = odev;
-    //odev->mouse_ep_name = odev->mouse_ep->name;
 
     odev->ctrl_req = usb_ep_alloc_request(gadget->ep0, GFP_KERNEL);
     if(!odev->ctrl_req){
@@ -403,10 +413,13 @@ static int  omimic_bind(struct usb_gadget *gadget)
     odev->ctrl_req->complete = omimic_setup_complete;
     PDBG("ep0 standby\n");
 
-    // XXX: kbd & mouse use the same idle_list, but the list is allocated for kbd_ep
-    //      in fact, s3c2410_alloc_buffer() doesn't use the 'ep' at all 
-    //      and s3c2410_alloc_request() only use the '_ep' to print debug info (see s3c2410_udc.c)
-    ret = populate_req_list(&odev->idle_list, odev->kbd_ep, intr_complete, KBD_BUFSIZE, NR_REQ);
+    /* XXX: kbd & mouse use the same idle_list, but the list is 
+     *      allocated for kbd_ep.
+     *      In fact, s3c2410_udc_alloc_request() only use the '_ep' 
+     *      to print debug info (see s3c2410_udc.c).
+     */
+    ret = populate_req_list(&odev->idle_list, odev->kbd_ep, 
+                            intr_complete, KBD_BUFSIZE, NR_REQ);
     if(ret){
         omimic_unbind(gadget);
         return ret;
@@ -417,7 +430,7 @@ static int  omimic_bind(struct usb_gadget *gadget)
     omimic_dev_desc.bMaxPacketSize0 = gadget->ep0->maxpacket;
     omimic_dev_qualifier.bMaxPacketSize0 = omimic_dev_desc.bMaxPacketSize0;
     
-    /* XXX: ignore OTG devices, and don't support auto resume */
+    /* ignore OTG devices, and don't support auto resume */
 
     usb_gadget_set_selfpowered(gadget);
 
@@ -430,7 +443,9 @@ static int  omimic_bind(struct usb_gadget *gadget)
         return ret;
     }
 
-    OMIMIC_PINFO("using devno: major=%d, minor=%d\n", MAJOR(odev->devno), MINOR(odev->devno));
+    /* XXX: add kobj and /sys support */
+    OMIMIC_PINFO("using devno: major=%d, minor=%d\n", 
+                 MAJOR(odev->devno), MINOR(odev->devno));
 
     cdev_init(&odev->cdev, &omimic_fops);
     odev->cdev.owner = THIS_MODULE;
@@ -475,7 +490,8 @@ static void omimic_unbind(struct usb_gadget *gadget)
     return;
 }
 
-static int  omimic_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *ctrl)
+static int  omimic_setup(struct usb_gadget *gadget, 
+                         const struct usb_ctrlrequest *ctrl)
 {
     struct omimic_dev *odev = get_gadget_data(gadget);
     struct usb_request *req = odev->ctrl_req;
@@ -484,12 +500,14 @@ static int  omimic_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest
     u16 w_value = le16_to_cpu(ctrl->wValue);
     u16 w_length = le16_to_cpu(ctrl->wLength);
 
-    PDBG("omimic_setup --> w_index:%u, w_value:%u, w_length:%u\n", w_index, w_value, w_length);
+    PDBG("omimic_setup --> w_index:%u, w_value:%u, w_length:%u\n", 
+         w_index, w_value, w_length);
 
     req->zero = 0;
     switch(ctrl->bRequest){
     case USB_REQ_GET_DESCRIPTOR:
-        PDBG("USB_REQ_GET_DESCRIPTOR: ctrl->bRequestType: %x\n", ctrl->bRequestType);
+        PDBG("USB_REQ_GET_DESCRIPTOR: ctrl->bRequestType: %x\n", 
+             ctrl->bRequestType);
         if(!(ctrl->bRequestType & USB_DIR_IN))
             goto unknown;
         switch(w_value >> 8){
@@ -518,7 +536,8 @@ static int  omimic_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest
             break;
         case USB_DT_STRING:
             PDBG("    USB_DT_STRING\n");
-            ret = usb_gadget_get_string(&omimic_strtab, w_value & 0xff, req->buf);
+            ret = usb_gadget_get_string(&omimic_strtab, w_value & 0xff, 
+                                        req->buf);
             if(ret >= 0)
                 ret = min(w_length, (u16)ret);
             break;
@@ -544,39 +563,31 @@ static int  omimic_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest
             PDBG("    unknown descriptor type: %d\n", w_value);
         }
         break;
-    case USB_REQ_SET_CONFIGURATION: /* XXX: this value duplicates the SET_REPORT request */
-        // XXX: there will be a non-zero status code from the usb core, 
-        //      resulting from 'nuke()' in s3c2410_udc.c, but won't stall the setup process
-        PDBG("USB_REQ_SET_CONFIGURATION: ctrl->bRequestType: %x\n", ctrl->bRequestType);
-//        if(ctrl->bRequestType != 0)
-//            goto unknown;
+    /* XXX: this value duplicates the SET_REPORT request */
+    case USB_REQ_SET_CONFIGURATION: 
+        PDBG("USB_REQ_SET_CONFIGURATION: ctrl->bRequestType: %x\n", 
+             ctrl->bRequestType);
         if(ctrl->bRequestType == (USB_RECIP_INTERFACE | USB_TYPE_CLASS)){
-            // XXX: handle SET_REPORT request
+            /* XXX: handle SET_REPORT request */
             goto unknown;
         }else if(ctrl->bRequestType != 0)
             goto unknown;
-
-        // ???
-        //if(gadget->a_hnp_support)
-        //    PDBG("    HNP available\n");
-        //else if(gadget->a_alt_hnp_support)
-        //    PDBG("    HNP needs a different root port\n");
-        //else
-        //    PDBG("    HNP inavtive\n");
 
         spin_lock(&odev->lock);
         ret = omimic_set_config(gadget, w_value, GFP_ATOMIC);
         spin_unlock(&odev->lock);
         break;
     case USB_REQ_GET_CONFIGURATION:
-        PDBG("USB_REQ_GET_CONFIGURATION: ctrl->bRequestType: %x\n", ctrl->bRequestType);
+        PDBG("USB_REQ_GET_CONFIGURATION: ctrl->bRequestType: %x\n", 
+             ctrl->bRequestType);
         if(ctrl->bRequestType != USB_DIR_IN)
             goto unknown;
         *(u8*)req->buf = odev->cur_config;
         ret = min(w_length, (u16)1);
         break;
     case USB_REQ_SET_INTERFACE:
-        PDBG("USB_REQ_SET_INTERFACE: ctrl->bRequestType: %x\n", ctrl->bRequestType);
+        PDBG("USB_REQ_SET_INTERFACE: ctrl->bRequestType: %x\n", 
+             ctrl->bRequestType);
         if(!(ctrl->bRequestType & USB_RECIP_INTERFACE))
             goto unknown;
         spin_lock(&odev->lock);
@@ -588,9 +599,10 @@ static int  omimic_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest
         }
         spin_unlock(&odev->lock);
         break;
-    case USB_REQ_GET_INTERFACE: /* XXX: this value duplicates the SET_IDLE request */
-        PDBG("USB_REQ_GET_INTERFACE: ctrl->bRequestType: %x\n", ctrl->bRequestType);
-        //if(ctrl->bRequestType != (USB_DIR_IN | USB_RECIP_INTERFACE))
+    /* XXX: this value duplicates the SET_IDLE request */
+    case USB_REQ_GET_INTERFACE: 
+        PDBG("USB_REQ_GET_INTERFACE: ctrl->bRequestType: %x\n", 
+             ctrl->bRequestType);
         if(!(ctrl->bRequestType & USB_RECIP_INTERFACE))
             goto unknown;
         if(!(ctrl->bRequestType & USB_DIR_IN)){
@@ -599,21 +611,23 @@ static int  omimic_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest
         }
         if(!odev->cur_config) break;
         if(w_index != 0){
-            ret = -EDOM; // ???
+            ret = -EDOM;
             break;
         }
         *(u8*)req->buf = 0;
         ret = min(w_length, (u16)1);
         break;
     case USB_REQ_GET_STATUS:
-        // XXX: to be written (seems to be optional)
-        PDBG("USB_REQ_GET_STATUS: ctrl->bRequestType: %x\n", ctrl->bRequestType);
+        /* XXX: to be written (seems to be optional) */
+        PDBG("USB_REQ_GET_STATUS: ctrl->bRequestType: %x\n", 
+             ctrl->bRequestType);
         break;
 
     /* class specific requests */
     case 0x02: /* GET_IDLE */
-        // XXX: to be written
-        PDBG("GET_IDLE: ctrl->bRequestType: %x\n", ctrl->bRequestType);
+        /* XXX: to be written */
+        PDBG("GET_IDLE: ctrl->bRequestType: %x\n", 
+             ctrl->bRequestType);
         break;
 
     /* ignore vendor-specific requests... */
@@ -623,27 +637,30 @@ unknown:
                 ctrl->bRequestType, ctrl->bRequest, w_value, 
                 w_index, w_length);
     }
+
     if(ret >= 0){
         PDBG("omimic_setup --> ret:%d\n", ret);
         req->length = ret;
-        req->zero = ret < w_length; /* indicate if there are pending zero's */
+        req->zero = ret < w_length;
         ret = usb_ep_queue(gadget->ep0, req, GFP_ATOMIC);
         PDBG("usb_ep_queue --> ret:%d\n", ret);
         if(ret < 0){
             PDBG("    ep queue --> %d\n", ret);
             req->status = 0;
-            omimic_setup_complete(gadget->ep0, req); /* call it myself to clean up the mess */
+            /* call the complete function myself to clean up the mass */
+            omimic_setup_complete(gadget->ep0, req);
         }
     }
 
     return ret;
 }
 
-static void omimic_setup_complete(struct usb_ep *ep, struct usb_request *req)
+static void omimic_setup_complete(struct usb_ep *ep, 
+                                  struct usb_request *req)
 {
     if(req->status || req->actual != req->length){
         PDBG("setup complete --> status:%d, actual:%d, length:%d\n",
-                req->status, req->actual, req->length);
+             req->status, req->actual, req->length);
         req->status = 0;
     }
 }
@@ -669,11 +686,7 @@ static void omimic_resume(struct usb_gadget *gadget)
 }
 
 static struct usb_gadget_driver omimic_driver = {
-//#ifdef CONFIG_USB_GADGET_DUALSPEED
-//    .speed = USB_SPEED_HIGH,
-//#else
-//    .speed = USB_SPEED_FULL,   /* we are always running at full speed */
-//#endif
+    /* we are always running at full speed */
     .speed = USB_SPEED_FULL,
     .function = (char *)LONG_NAME,
     .bind = omimic_bind,
@@ -712,7 +725,8 @@ static void __free_ep_req(struct usb_ep *ep, struct usb_request *req)
     usb_ep_free_request(ep, req);
 }
 
-static int  omimic_set_config(struct usb_gadget *gadget, unsigned number, unsigned gfp_flags)
+static int  omimic_set_config(struct usb_gadget *gadget, 
+                              unsigned number, unsigned gfp_flags)
 {
     int res = 0;
     struct omimic_dev *odev = get_gadget_data(gadget);
@@ -731,7 +745,10 @@ static int  omimic_set_config(struct usb_gadget *gadget, unsigned number, unsign
     case 0:
         return res;
     }
-    if(!res && !odev->kbd_ep) res = -ENODEV;
+
+    if(!res && !odev->kbd_ep) 
+        res = -ENODEV;
+
     if(res) omimic_reset_config(gadget);
     else{
         char *speed;
@@ -766,13 +783,15 @@ static void omimic_reset_config(struct usb_gadget *gadget)
     odev->cur_config = 0;
 }
 
-static int config_buf(struct usb_gadget *gadget, u8 *buf, u8 type, unsigned index)
+static int config_buf(struct usb_gadget *gadget, u8 *buf, 
+                      u8 type, unsigned index)
 {
     int len;
 
     PDBG("config_buf --> type:%d, index:%d\n", type, index);
 
-    if(index > 0) return -EINVAL; /* currently there's only one conf */
+    /* currently there's only one conf */
+    if(index > 0) return -EINVAL; 
     len = usb_gadget_config_buf(&km_config, buf, USB_BUFSIZE, km_func);
     if(len < 0) return len;
     ((struct usb_config_descriptor *)buf)->bDescriptorType = type;
@@ -783,28 +802,8 @@ static int set_km_config(struct usb_gadget *gadget, unsigned gfp_flags)
 {
     int res;
     struct omimic_dev *odev = get_gadget_data(gadget);
-//    struct usb_ep *ep;
-//    const struct usb_endpoint_descriptor *d;
 
     PDBG("set_km_config\n");
-
-//    gadget_for_each_ep(ep, gadget){
-//        if(strcmp(ep->name, odev->kbd_ep_name) == 0){
-//            res = usb_ep_enable(ep, &kbd_ep_desc);
-//            if(res == 0){
-//                PDBG("ep enabled: %s\n", ep->name);
-//                ep->driver_data = odev;
-//                odev->kbd_ep = ep;
-//            }
-//        }else if(strcmp(ep->name, odev->kbd_ep_name) == 0){
-//            res = usb_ep_enable(ep, &mouse_ep_desc);
-//            if(res == 0){
-//                PDBG("ep enabled: %s\n", ep->name);
-//                ep->driver_data = odev;
-//                odev->mouse_ep = ep;
-//            }
-//        }
-//    }
 
     res = usb_ep_enable(odev->kbd_ep, &kbd_ep_desc);
     if(res == 0){
@@ -835,7 +834,7 @@ static void intr_complete(struct usb_ep *ep, struct usb_request *req)
     PDBG("intr_complete\n");
 
     switch(status){
-    case 0: /* normal completion */
+    case 0:  /* normal completion */
         PDBG("intr_complete: success\n");
         /* move the request to the idle list */
         spin_lock(&odev->lock);
@@ -843,19 +842,18 @@ static void intr_complete(struct usb_ep *ep, struct usb_request *req)
         list_add(&oreq->list, &odev->idle_list);
         spin_unlock(&odev->lock);
         break;
-    default: /* error occurs*/
-        OMIMIC_PERR("%s kbd intr complete --> status:%d, actual:%d, length:%d\n",
-                ep->name, status, req->actual, req->length);
+    default:  /* error occurs*/
+        OMIMIC_PERR("%s kbd intr complete --> status:%d, actual:%d, "
+                    "length:%d\n",
+                    ep->name, status, req->actual, req->length);
     case -ECONNABORTED:
     case -ECONNRESET:
     case -ESHUTDOWN:
-//        __free_ep_req(ep, req);
         return;
     }
 }
 
-static struct usb_request *alloc_ep_req(struct usb_ep* ep, 
-        unsigned length)
+static struct usb_request *alloc_ep_req(struct usb_ep* ep, unsigned length)
 {
     struct usb_request *req;
     req = usb_ep_alloc_request(ep, GFP_ATOMIC);
@@ -873,7 +871,8 @@ static struct usb_request *alloc_ep_req(struct usb_ep* ep,
 
 static int omimic_open(struct inode *inode, struct file *file)
 {
-    struct omimic_dev *odev = container_of(inode->i_cdev, struct omimic_dev, cdev);
+    struct omimic_dev *odev = container_of(inode->i_cdev, 
+                                           struct omimic_dev, cdev);
     file->private_data = odev;
     return 0;
 }
@@ -884,7 +883,8 @@ static int omimic_release(struct inode *inode, struct file *file)
     return 0;
 }
 
-static ssize_t omimic_write(struct file *file, const char __user *buf, size_t count, loff_t *pos)
+static ssize_t omimic_write(struct file *file, const char __user *buf, 
+                            size_t count, loff_t *pos)
 {
     struct omimic_dev *odev = file->private_data;
     struct omimic_req *oreq;
@@ -910,7 +910,8 @@ static ssize_t omimic_write(struct file *file, const char __user *buf, size_t co
     list_del(&oreq->list);
     list_add(&oreq->list, &odev->busy_list);
     spin_unlock(&odev->lock);
-    if(copy_from_user(oreq->req->buf, buf, count)){  /* XXX: a few bytes a time may lag the system */
+    /* XXX: a few bytes a time may lag the system */
+    if(copy_from_user(oreq->req->buf, buf, count)){
         OMIMIC_PERR("can't copy from user space, abort.\n");
         return -EFAULT;
     }
@@ -922,7 +923,8 @@ static ssize_t omimic_write(struct file *file, const char __user *buf, size_t co
     return count;
 }
 
-static int populate_req_list(struct list_head *head, struct usb_ep *ep, void *complete, int size, int nr)
+static int populate_req_list(struct list_head *head, struct usb_ep *ep, 
+                             void *complete, int size, int nr)
 {
     int i;
     struct omimic_req *oreq;
@@ -953,3 +955,4 @@ check_list:
 
     return 0;
 }
+
