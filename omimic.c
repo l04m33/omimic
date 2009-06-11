@@ -68,6 +68,8 @@ struct omimic_dev {
 
     dev_t devno;
     struct cdev cdev;
+
+    struct device dev;
 };
 
 struct omimic_req {
@@ -443,7 +445,6 @@ static int  omimic_bind(struct usb_gadget *gadget)
         return ret;
     }
 
-    /* XXX: add kobj and /sys support */
     OMIMIC_PINFO("using devno: major=%d, minor=%d\n", 
                  MAJOR(odev->devno), MINOR(odev->devno));
 
@@ -456,6 +457,24 @@ static int  omimic_bind(struct usb_gadget *gadget)
         return ret;
     }
 
+    snprintf(odev->dev.bus_id, sizeof(odev->dev.bus_id), "omimic");
+    odev->dev.devt = odev->devno;
+    odev->dev.class = &input_class;
+    odev->dev.parent = NULL;
+    odev->dev.release = NULL;
+    device_initialize(&odev->dev);
+
+    /* flag to indicate that the device is successfully added */
+    odev->dev.driver_data = (void *)1;
+
+    ret = device_add(&odev->dev);
+    if(ret){
+        OMIMIC_PERR("Failed to register device, abort.\n");
+        odev->dev.driver_data = NULL;
+        omimic_unbind(gadget);
+        return ret;
+    }
+
     return 0;
 }
 
@@ -463,6 +482,9 @@ static void omimic_unbind(struct usb_gadget *gadget)
 {
     struct omimic_dev *odev = get_gadget_data(gadget);
     struct omimic_req *oreq, *tmp_oreq;
+
+    if(odev->dev.driver_data)
+        device_del(&odev->dev);
 
     if(odev->cdev.dev) cdev_del(&odev->cdev);
     if(odev->devno) unregister_chrdev_region(odev->devno, 1);
